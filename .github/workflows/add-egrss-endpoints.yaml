@@ -1,0 +1,167 @@
+name: Add Egress Endpoints
+
+on:
+  push:
+    branches:
+      - test/validation
+  workflow_dispatch:
+    inputs:
+      repositoryName:
+        description: 'Repository Name'
+        required: true
+        type: string
+      functionName:
+        description: 'Function Names'
+        required: true
+        type: string
+      environment:
+        description: 'Environment'
+        required: true
+        type: string
+
+jobs:
+  add-egress:
+    runs-on: aexp-ubuntu-latest-medium
+
+    steps:
+      # Uncomment if label check is required
+      # - name: Check if issue has the correct label
+      #   if: contains(github.event.issue.labels.*.name, 'add-egress-entries')
+      #   run: echo "Label 'add-egress-entries' found, proceeding with the job."
+
+      # Uncomment if extracting from issue body
+      # - name: Extract values from issue body and set environment variables
+      #   if: contains(github.event.issue.labels.*.name, 'add-egress-entries')
+      #   run: |
+      #     ISSUE_BODY="${{ github.event.issue.body }}"
+      #     echo "Issue Body: $ISSUE_BODY"
+      #     REPOSITORY_NAME=$(echo "${ISSUE_BODY}" | awk '/### Repository Name/{getline; getline; print}')
+      #     FUNCTION_NAMES=$(echo "${ISSUE_BODY}" | awk '/### Function\(s\)/{getline; getline; print}')
+      #     ENVIRONMENT=$(echo "${ISSUE_BODY}" | awk '/### Environment/{getline; getline; print}')
+      #     echo "REPOSITORY_NAME=${REPOSITORY_NAME}" >> $GITHUB_ENV
+      #     echo "FUNCTION_NAMES=${FUNCTION_NAMES}" >> $GITHUB_ENV
+      #     echo "ENVIRONMENT=${ENVIRONMENT}" >> $GITHUB_ENV
+
+      - name: Set environment variables
+        run: |
+          echo "REPOSITORY_NAME=${{ github.event.inputs.repositoryName }}" >> $GITHUB_ENV
+          echo "FUNCTION_NAMES=${{ github.event.inputs.functionName }}" >> $GITHUB_ENV
+          echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+
+      - name: Debug values
+        run: |
+          echo "Extracted Repository: $REPOSITORY_NAME"
+          echo "Extracted Functions: $FUNCTION_NAMES"
+          echo "Extracted Environment: $ENVIRONMENT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          repository: amex-eng/${{ env.REPOSITORY_NAME }}
+          ref: main
+          token: ${{ secrets.ONE_AMEX_CICD_PAT }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.ONE_AMEX_CICD_PAT }}
+
+      - name: Install dependencies
+        run: sudo apt-get install jq -y
+
+      - name: Get Egress Entries
+        id: get-egress-entries
+        run: |
+          configFileName='endpoints.json'
+          declare -A endpointsData
+          declare -a invalidHosts
+
+          IFS=',' read -r -a functionNamesArray <<< "${FUNCTION_NAMES}"
+          env=$(echo "${ENVIRONMENT}" | cut -c1-2)
+          jsonOutput="{"
+
+          ip_regex='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+          invalid_domain_regex='americanexpress\.com$'
+
+          for functionName in "${functionNamesArray[@]}"; do
+            baseDir="config/${functionName}"
+            dirs=$(ls ${baseDir} | grep $env)
+
+            for dir in $dirs; do
+              if [[ "${ENVIRONMENT}" == *"ind" && ! "${dir,,}" == *"ind"* ]]; then
+                continue
+              elif [[ ! "${ENVIRONMENT}" == *"ind" && "${dir,,}" == *"ind"* ]]; then
+                continue
+              fi
+
+              configPath="${baseDir}/${dir}/${configFileName}"
+              absoluteConfigPath="${GITHUB_WORKSPACE}/${configPath}"
+
+              if [[ -f "${absoluteConfigPath}" ]]; then
+                jsonData=$(cat "${absoluteConfigPath}")
+
+                for key in $(echo "${jsonData}" | jq -r '.endpoints | keys[]'); do
+                  host=$(echo "${jsonData}" | jq -r ".endpoints[\"${key}\"].host")
+                  isArray=$(echo "${jsonData}" | jq -r ".endpoints[\"${key}\"].ports | if type == \"array\" then \"true\" else \"false\" end")
+
+                  if [[ "$isArray" != "true" ]]; then
+                    echo "Error: 'ports' must be an array for host: ${host}"
+                    exit 1
+                  fi
+
+                  ports=$(echo "${jsonData}" | jq -r ".endpoints[\"${key}\"].ports | join(\",\")")
+
+                  if [[ "$host" =~ $ip_regex || "$host" =~ $invalid_domain_regex ]]; then
+                    if [[ -n "${invalidHosts[${host}]}" ]]; then
+                      invalidHosts["${host}"]+=",${ports}"
+                    else
+                      invalidHosts["${host}"]="${ports}"
+                    fi
+                    continue
+                  fi
+
+                  if [[ -n "${endpointsData[${host}]}" ]]; then
+                    endpointsData["${host}"]+=",${ports}"
+                  else
+                    endpointsData["${host}"]="${ports}"
+                  fi
+                done
+              fi
+            done
+          done
+
+          for host in "${!endpointsData[@]}"; do
+            uniquePorts=$(echo "${endpointsData[${host}]}" | tr ',' '\n' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            jsonOutput+="\"${host}\": [${uniquePorts}],"
+          done
+
+          jsonOutput="${jsonOutput%,}}"
+          echo "Valid Entries: ${jsonOutput}"
+          echo "::set-output name=jsonOutput::${jsonOutput}"
+
+          echo "Invalid Entries:"
+          for invalidHost in "${invalidHosts[@]}"; do
+            echo "$invalidHost"
+          done
+
+          if [[ ${#invalidHosts[@]} -eq 0 ]]; then
+            echo "::set-output name=invalidHostsEmpty::true"
+          else
+            echo "::set-output name=invalidHostsEmpty::false"
+          fi
+        env:
+          FUNCTION_NAMES: ${{ env.FUNCTION_NAMES }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+
+      - name: Run JavaScript Egress Checker
+        uses: ./.github/actions/check-egress
+        with:
+          map: ${{ steps.get-egress-entries.outputs.jsonOutput }}
+          environment: ${{ env.ENVIRONMENT }}
+          token: ${{ secrets.YOUR_API_TOKEN_SECRET }}
+
+
+      - name: Close Issue if No Valid Entries
+        if: contains(github.event.issue.labels.*.name, 'add-egress-entries') && steps.get-egress-entries.outputs.invalidHostsEmpty == 'true'
+        uses: amex-ghactions/close-issue@cbd0b076f5396f99a0a59d2a8054178d5451e8cd
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.issue.number }}
+          comment: "No invalid egress entries found. Closing issue."
